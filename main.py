@@ -1,9 +1,10 @@
 import argparse
-import torrentparse
+import torrentparser
 import hashlib
 import requests
 from requests import RequestException
 from itertools import chain
+import bencode
 
 class TorrentClient(object):
     def __init__(self, metainfo, tracker_list):
@@ -18,8 +19,9 @@ class TorrentClient(object):
     def get_tracker_peerList(self, url, metainfo):
         # Params are the parameters required to send a properly formatted
         # request to the tracker
+
         params = {
-            "info_hash": hashlib.sha1(bencode.bencode(metainfo['info'])).digest(),
+            "info_hash": hashlib.sha1(bencode.bencode(metainfo.metainfo['info'])).digest(),
             "peer_id": "HEOL-123456789012356",
             "left": self.get_left(metainfo),
         }
@@ -32,11 +34,11 @@ class TorrentClient(object):
         """ left corresponsds to the total length of the file"""
         sum = 0
         # Check if the torrent is one or more files
-        if metainfo['info'].has_key('files'):
-            for file in metainfo['info']['files']:
+        if metainfo.metainfo['info'].has_key('files'):
+            for file in metainfo.metainfo['info']['files']:
                 sum += file['length']
         else:
-            sum = metainfo['info']['length']
+            sum = metainfo.metainfo['info']['length']
             return sum
         return sum
                 
@@ -64,7 +66,7 @@ def main():
     arg_parser.add_argument("t_file", help="this is the torrent file we aim to download")
     args = arg_parser.parse_args()
     t_parser = torrentparser.TorrentParser(args.t_file)
-    t_client = TorrentClient(t_parser.get_metainfo(), t_parser.get_trackerList())
+    t_client = TorrentClient(t_parser.get_metainfo(), t_parser.get_metainfo().get_trackerList())
     
 if __name__ == "__main__":
     main()
