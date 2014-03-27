@@ -24,9 +24,12 @@ class TorrentClient(object):
             "info_hash": hashlib.sha1(bencode.bencode(metainfo.metainfo['info'])).digest(),
             "peer_id": "HEOL-123456789012356",
             "left": self.get_left(metainfo),
+            "compact" : 1,
+            "downloaded": 0,
+            "uploaded" : 0,
+            "port" : 10000,
         }
         tracker_connection = requests.get(url, params=params)
-        print tracker_connection.url
         response = tracker_connection.content
         return bencode.bdecode(response)
 
