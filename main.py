@@ -5,6 +5,8 @@ import requests
 from requests import RequestException
 from itertools import chain
 import bencode
+import socket
+import struct
 
 class TorrentClient(object):
     def __init__(self, metainfo, tracker_list):
@@ -13,13 +15,47 @@ class TorrentClient(object):
                 response = self.get_tracker_peerList(tracker, metainfo)
             except RequestException, e:
                 continue
-        peer_list = self.get_peer_addr(response["peers"])
-        print peer_list
+        peer_list = self.get_peer_addr_list(response["peers"])
+        self.handshake_peer(peer_list, metainfo)
 
+    def handshake_peer(self, peer_list, metainfo):
+        bencode_metainfo = metainfo.get_bencode_metainfo()
+        for peer in peer_list:
+            pipe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer_addr = (peer['ip'], peer['port'])
+            pipe.settimeout(2.0)
+            handshake = self.get_handshake(bencode_metainfo)
+            try:
+                pipe.connect(peer_addr)
+            except socket.timeout:
+                print "socket timed out"
+      
+            pipe.send(handshake)
+
+    def get_handshake(self, metainfo):
+        reserved_fmt = 'd'
+        reserved = 0
+
+        pstr_fmt = '19s'
+        pstr = 'BitTorrent protocol'
+
+        pstrlen_fmt = 'b'
+        pstrlen = 19
+
+        peer_id_fmt = '20s'
+        peer_id = 'HEOL-123456789012356'
+
+        info_hash_fmt = '20s'
+        info_hash = hashlib.sha1(bencode.bencode(metainfo['info'])).digest()
+
+        struct_fmt = pstrlen_fmt + pstr_fmt + reserved_fmt + info_hash_fmt + peer_id_fmt
+        handshake = struct.pack(struct_fmt, pstrlen, pstr, reserved, info_hash, peer_id)
+        return handshake
+    
     def get_tracker_peerList(self, url, metainfo):
         # Params are the parameters required to send a properly formatted
         # request to the tracker
-
+        ## These paramaters are ALL NECESSARY for the tracker to return a peer list.
         params = {
             "info_hash": hashlib.sha1(bencode.bencode(metainfo.metainfo['info'])).digest(),
             "peer_id": "HEOL-123456789012356",
@@ -34,7 +70,7 @@ class TorrentClient(object):
         return bencode.bdecode(response)
 
     def get_left(self, metainfo):
-        """ left corresponsds to the total length of the file"""
+        """ left corresponds to the total length of the file"""
         sum = 0
         # Check if the torrent is one or more files
         if metainfo.metainfo['info'].has_key('files'):
@@ -45,7 +81,7 @@ class TorrentClient(object):
             return sum
         return sum
                 
-    def get_peer_addr(self, response):
+    def get_peer_addr_list(self, response):
         peer_list = []
         peer_dec = map(ord, response)
         for num in range(0, len(response), 6):
