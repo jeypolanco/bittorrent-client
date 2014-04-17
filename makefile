@@ -4,7 +4,7 @@ tor_file=$(shell find -H . -maxdepth 1 -iname "*torrent" | sed -n '$(ran_num)p')
 
 # I changed this to test1.torrent because test.torrent seems to not work
 run: main.py
-	python main.py test1.torrent
+	python main.py test2.torrent
 
 rrun: main.py
 	python main.py $(tor_file)
