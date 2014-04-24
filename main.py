@@ -181,26 +181,24 @@ class PieceAssembler(object):
             inpf.write(tmp_buff)
 
     def loop(self):
-#        while True:
+        while True:
             want_to_read = []
             want_to_write = []
             for peer in self.connected_peers:
                 want_to_read.append(peer)
-                if peer.sent_handshake:
-                    if peer.sent_interested:
-                        if peer.getting_piece:
-                            if peer.missing_blocks:
-                                want_to_write.append(peer)
-                            else:
-                                self.set_piece(peer.piece_index,
-                                               peer.get_assembled_piece(), peer)
+                if peer.state['sent interested']:
+                    if peer.state['getting piece']:
+                        if peer.state['missing blocks']:
+                            want_to_write.append(peer)
                         else:
+                            self.set_piece(peer.piece_index,
+                                           peer.get_assembled_piece(), peer)
+                    else:
+                        if peer.state['received pieces list']:
                             missing_piece = self.get_missing_piece()
                             if peer.has_piece(missing_piece):
                                 peer.get_piece(missing_piece)
                                 self.transit.append(missing_piece)                                
-                    else:
-                        want_to_write.append(peer)
                 else:
                     want_to_write.append(peer)
             rs, ws, xs = select.select(want_to_read, want_to_write, [])
@@ -213,27 +211,18 @@ class PieceAssembler(object):
                     self.connected_peers.remove(r)
                     self.connected_peers.append(self.connect_to_new_peer(self.peer_list))
                 else:
-                    r.parse_message(output)
+                    r.set_state(r.parse_messages(output))
                     r.most_recent_read = int(time.time())
             for w in ws:
-                w.generate_msg()
+                w.set_state(w.generate_msg())
 
 class PeerListener(object):
     def __init__(self, peer_addr, metainfo):
 
         # Peer state global variables
-        self.sent_handshake = False
-        self.sent_interested = False
-        self.sent_request = False
-        
-        self.getting_piece = False
-        self.getting_block = False
-        self.missing_blocks = True
-        
-        self.received_handshake = False
-        self.received_pieces_list = False
-        self.received_unchoke = False
-
+        self.state = {'sent handshake': False, 'sent interested': False, 'sent request': False,
+                      'getting piece': False, 'getting block': False, 'missing blocks': True,
+                      'received handshake': False, 'received pieces list': False, 'received unchoke': False}
         self.metainfo = metainfo
         self.block_request_size = 2 ** 14
         self.block_list, self.last_block_size = self.get_block_list()
@@ -263,65 +252,93 @@ class PeerListener(object):
     def fileno(self):
         return self.sock.fileno()
 
-    def disconnect(self):
-        self.connected = False
+    def get_state(self):
+        """Returns a dictionary consisting of variables that define the state of the peer"""
+        return self.state
 
-    def parse_message(self, message):
-        message = self.msg_recv + message
-        while len(message) > 4:
-            prefix_length = struct.unpack(">i", message[0:4])[0]
-            message_id = struct.unpack(">b", message[4])[0]
-            # I'm slicing out the prefix length and message_id byte
-            payload = message[5:prefix_length + 4]
-            if self.sent_handshake:
-                if message[:20] == '\x13BitTorrent protocol':
-                    # remove the handshake from the message
-                    message = message[68:]
-                    self.received_handshake = True
-                elif message_id == self.id_dict['bitfield']:
-                    ## Assumption: I'm going to assume that the bitfield message
-                    ## will ALWAYS come before a have message and it will only
-                    ## arrive ONCE.  This assumption is correct at list in so far
-                    ## that the bitfield message will only ever follow a handshake.
-                    ## At least in a client that follows specifications.
-                    # The following turns the payload into parsable input for the
-                    # bitstring.BitArray class to represent the pieces this peer has
-                    self.pieces_list = bitstring.BitArray("".join(map(hex, map(ord, payload))))
-                    message = message[prefix_length+4:]
-                    self.received_pieces_list = True
-                elif message_id == self.id_dict['have']:
-                    # If my assumption is wrong I won't be able to get the pieces a
-                    # peer has in my piece assembler
-                    index = struct.unpack(">i", payload)[0]
-                    self.pieces_list[index] = True
-                    message = message[prefix_length+4:]
-                elif prefix_length == self.id_dict['keep alive']:
-                    message = message[4:]
+    def parse_messages(self, raw_message):
+        message_list = []
+        last_complete_message = True
+        while last_complete_message and len(raw_message) > 4:
+            message_dict = {}
+            # This is only necessary because I want the method that I use to set
+            # the state of the peer to take messages that have both been sent
+            # and received.
+            message_dict['sent'] = ''
+            message_dict['prefix length'] = struct.unpack(">i", raw_message[0:4])[0]
+            raw_payload = raw_message[4:message_dict['prefix length'] + 4]
+            # keep-alive message
+            if message_dict['prefix length'] == 0:
+                message_dict['message id'] = message_dict['prefix length']
+                next_msg_offset = message_dict['prefix length'] + 4
+                raw_message = raw_message[next_msg_offset:]
+                message_list.append(message_dict)
+            # handshake response
+            elif raw_message[:20] == '\x13BitTorrent protocol':
+                message_dict['message id'] = 'handshake'
+                message_dict['payload'] =  raw_message[0:68]
+                raw_message = raw_message[68:]
+                message_list.append(message_dict)
+            # all other bt protocol messages
+            elif len(raw_payload) == message_dict['prefix length']:
+                message_dict['message id'] = struct.unpack(">b", raw_message[4])[0]
+                message_dict['payload'] = self.parse_payload(raw_payload)
+                message_list.append(message_dict)
+                next_msg_offset = message_dict['prefix length'] + 4
+                raw_message = raw_message[next_msg_offset:]                    
+            else:
+                # I need to save the incomplete message and add it to the raw
+                # message for the next time this method is called
+                message_dict['incomplete'] = raw_message
+                last_complete_message = False
+        return message_list
+
+    def parse_payload(self, raw_payload):
+        payload_dict = {}
+        message_id = struct.unpack('!b', raw_payload[0])[0]
+        if self.id_dict['bitfield'] == message_id:
+            payload_dict['bitfield'] = bitstring.BitArray("".join(map(hex, map(ord, raw_payload[1:]))))
+        elif self.id_dict['have'] == message_id:
+            payload_dict['piece index'] = raw_payload[1:]
+        elif self.id_dict['piece'] == message_id:
+            payload_dict['index'] = raw_payload[1:5]
+            payload_dict['begin'] = raw_payload[5:9]
+            payload_dict['block'] = raw_payload[9:]
+        return payload_dict
+
+    def set_state(self, message_list):
+        """Method takes a list of messages read or written by the peer and uses the
+        message id to set the state"""
+        for message in message_list:
+            print message
+            if message['sent'] == 'request':
+                self.state['sent request'] = True
+            elif message['sent'] == 'interested':
+                self.state['sent interested'] = True
+            elif message['sent'] == 'handshake':
+                self.state['sent handshake'] = True
+            elif message['message id'] == 'handshake':
+                self.state['received handshake'] = True
+            elif message['message id'] == self.id_dict['bitfield']:
+                self.pieces_list = message['payload']['bitfield']
+                self.state['received pieces list'] = True
+            elif message['message id'] == self.id_dict['have']:
+                index = struct.unpack('!i', message['payload']['piece index'])[0]
+                self.pieces_list[index] = True
+            elif message['prefix length'] == self.id_dict['keep alive']:
+                pass
+            elif message['message id'] == self.id_dict['unchoke']:
+                self.state['received unchoke'] = True
+            elif message['message id'] == self.id_dict['choke']:
+                self.state['received unchoke'] = False
+                self.state['sent interested'] = False
+            elif message['message id'] == self.id_dict['piece']:
+                self.set_block(message['payload'])
+        return 0
                     
-                elif self.sent_interested:
-                    if message_id == self.id_dict['unchoke']:
-                        message = message[prefix_length+4:]
-                        self.received_unchoke = True
-                        
-                    elif self.sent_request:
-                        if message_id == self.id_dict['choke']:
-                            message = message[prefix_length+4:]
-                            self.received_unchoke = False
-                            self.sent_interested = False
-                        elif message_id == self.id_dict['piece']:
-                            print 'foo'
-                            self.set_block(payload)
-                            print 'world'
-                            if '' in self.block_list.viewvalues():
-                                pass
-                            else:
-                                self.missing_blocks = False
-                            message = message[prefix_length+4:]
-
-        self.msg_recv = message
 
     def get_block_list(self):
-        """Function returns an empty block list with the index values of each block as a
+        """Method returns an empty block list with the index values of each block as a
         key to the dict and number remainder that let's us now if the last block
         is smaller than all the other blocks we request.
 
@@ -346,8 +363,7 @@ class PeerListener(object):
         """Save block from peer to a dictionary"""
         #### Set up your logic for handling pieces here####
         #### Have a variable that stores the blocks in transit ####
-        index = struct.unpack("!i", payload[0:4])
-        if index == self.transit_block['index']:
+        if payload['index'] == self.transit_block['index']:
             begin = self.block_request_size * struct.unpack("!i", payload[4:8])
             if begin == self.transit_block['begin']:
                 block_len = len(payload[9:])
@@ -355,29 +371,45 @@ class PeerListener(object):
                     self.block_list[index] = payload[9:]
                 
     def write(self, message):
-        # I'm going to assume that my the messages I send will
-        # always be small enough to send.  This assumption will be
-        # false when you serve files to peers
         try:
             sent = self.sock.send(message)
-            if sent == len(message):
-                 return True
+            return sent
         except socket.error as err:
             print err
+            return 0
 
     def generate_msg(self):
-        if self.received_handshake:
-            if self.received_pieces_list:
-                if self.received_unchoke:
-                    self.sent_request = self.write(self.get_request_msg())
+        """Method sends a single message according to the state of the peer and returns
+        a dict with the value of the sent message
+
+        """
+        message = {'sent': '', 'message id': '', 'payload': '', 'prefix length': ''}
+        if self.state['received handshake']:
+            if self.state['received pieces list']:
+                if self.state['received unchoke']:
+                    ###### rewrite this so that it can send multiple request but
+                    ###### limit the number of request
+                    msg = self.get_request_msg()
+                    sent_len = self.write(msg)
+                    if len(msg) == sent_len:
+                        message['sent'] = 'request'
                 else:
-                    self.sent_interested = self.write(self.get_interested_msg())
+                    if not self.state['sent interested']:
+                        msg = self.get_interested_msg()
+                        sent_len = self.write(msg)
+                        if len(msg) == sent_len:
+                            message['sent'] = 'interested'                    
             else:
                 # peer is connected and received a hanshake but is waiting
                 # for bitfield and have messages
-                pass
+                message['sent'] = ''
         else:
-             self.sent_handshake = self.write(self.get_handshake_msg())
+            if not self.state['sent handshake']:
+                msg = self.get_handshake_msg()
+                sent_len = self.write(msg)
+                if len(msg) == sent_len:
+                    message['sent'] = 'handshake'
+        return [message]
 
     def get_interested_msg(self):
         return '\x00\x00\x00\x01\x02'
@@ -428,15 +460,9 @@ class PeerListener(object):
         else:
             return False
 
-#    def getting_piece(self):
-#        if self.piece_index == None:
-#            return False
-#        else:
-#            return True
-    
     def get_piece(self, piece_ind):
         self.piece_index = piece_ind
-        self.getting_piece = True
+        self.state['getting piece'] = True
 
 def main():
     arg_parser = argparse.ArgumentParser()
