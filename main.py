@@ -15,7 +15,7 @@ class PieceAssembler(object):
        pieces into the torrent file"""
     def __init__(self, metainfo):
         self.metainfo = metainfo
-        self.peer_list = self.get_peer_list(self.get_tracker_list())
+        self.peer_list = self.get_peer_list(self.get_tracker_list(metainfo))
         # The 'pieces' element in the .torrent metafile includes a string of
         # 20-byte hashes, one for each piece in the torrent
         self.num_pieces = len(metainfo['info']['pieces'])/20
@@ -27,27 +27,39 @@ class PieceAssembler(object):
         # and values corresponding to the data sent by a peer
         self.pieces = {}
 
-    def get_tracker_list(self):
+    def get_tracker_list(self, metainfo):
         tracker_list = []
-        tracker_list.append(self.metainfo['announce'])
-        for tracker in self.metainfo['announce-list']:
-            tracker_list.append(tracker[0])
+        if 'http' in metainfo['announce']:
+            tracker_list.append(metainfo['announce'])
+        for tracker in metainfo['announce-list']:
+            if 'http' in tracker[0]:
+                tracker_list.append(tracker[0])
         return tracker_list
     
     def get_peer_list(self, tracker_list):
+        peer_str_response = ''
         for tracker in tracker_list:
             # This will return the last tracker in the list to give a valid response
             ## If you would like more peers I suggest to change this method to
             ## allow for multiple tracker
-            try:
-                response = self.get_tracker_peerList(tracker, self.metainfo)
-            except RequestException, e:
-                continue
-            if response.has_key('failure reason'):
-                print response['failure reason']
-            else:
-                peer_list = self.get_peer_addr_list(response["peers"])
-                return peer_list
+            response = self.get_tracker_peerList(tracker, self.metainfo)
+            if type(response) == dict:
+                if response.has_key('failure reason'):
+                    print response['failure reason']
+                elif response.has_key('peers'):
+                    peer_str_response += response['peers']
+        peer_list = self.get_peer_addr_list(peer_str_response)
+        return peer_list
+        
+    def get_peer_addr_list(self, response):
+        peer_list = []
+        peer_dec = map(ord, response)
+        for num in range(0, len(response), 6):
+            peer_dict = {}
+            peer_dict["ip"] = "{0}.{1}.{2}.{3}".format(peer_dec[num], peer_dec[num+1], peer_dec[num+2], peer_dec[num+3])
+            peer_dict["port"] = 256 * peer_dec[num+4] + peer_dec[num+5]
+            peer_list.append(peer_dict)
+        return peer_list
 
     def connect_to_peers(self, peer_list):
         connected_peers = []
@@ -77,9 +89,13 @@ class PieceAssembler(object):
             "uploaded" : 0,
             "port" : 10000,
         }
-        tracker_connection = requests.get(url, params=params)
-        response = tracker_connection.content
-        return bencode.bdecode(response)
+        try:
+            tracker_connection = requests.get(url, params=params, timeout=2.0)
+            response = tracker_connection.content
+            if response:
+                return bencode.bdecode(response)
+        except requests.exceptions.Timeout as err:
+            print err
 
     def get_left(self, metainfo):
         """ left corresponds to the total length of the file"""
@@ -92,26 +108,16 @@ class PieceAssembler(object):
             sum = metainfo['info']['length']
             return sum
         return sum
-                
-    def get_peer_addr_list(self, response):
-        peer_list = []
-        peer_dec = map(ord, response)
-        for num in range(0, len(response), 6):
-            peer_dict = {}
-            peer_dict["ip"] = "{0}.{1}.{2}.{3}".format(peer_dec[num], peer_dec[num+1], peer_dec[num+2], peer_dec[num+3])
-            peer_dict["port"] = 256 * peer_dec[num+4] + peer_dec[num+5]
-            peer_list.append(peer_dict)
-        return peer_list
-#        decoded_dec_peer = map(ord, response['peers'])
         
     def connect_to_new_peer(self, peer_list):
         for peer_addr in peer_list:
             for peer in self.connected_peers:
                 try:
                     sock_addr = peer.sock.getpeername()[0]
-                    peer = PeerListener(peer_addr, self.metainfo)
-                    if peer.is_connected():
-                        return peer
+                    if peer_addr != sock_addr:
+                        peer = PeerListener(peer_addr, self.metainfo)
+                        if peer.is_connected():
+                            return peer
                 except socket.error as err:
                     print err
             
@@ -370,7 +376,11 @@ class PeerListener(object):
             return message_dict['message id']
         elif message_dict['message id'] == self.id_dict['have']:
             index = struct.unpack('!i', message_dict['payload']['piece index'])[0]
-            self.pieces_list[index] = True
+            if self.pieces_list != None:
+                self.pieces_list[index] = True
+            else:
+                self.pieces_list = bitstring.BitArray(len(self.metainfo['info']['pieces'])/20)
+                self.pieces_list[index] = True
             return message_dict['message id']
         elif message_dict['prefix length'] == self.id_dict['keep alive']:
             return message_dict['prefix length']
@@ -413,12 +423,13 @@ class PeerListener(object):
         """Save block from peer to a dictionary and return the index value of the block"""
         #### Set up your logic for handling pieces here####
         #### Have a variable that stores the blocks in transit ####
-        if payload['index'] == self.transit_block['index']:
-            begin = struct.unpack("!i", payload['begin'])[0]
-            begin_index = begin / self.block_request_size
-            if payload['begin'] == self.transit_block['begin']:
+        begin = struct.unpack("!i", payload['begin'])[0]
+        begin_index = begin / self.block_request_size
+        transit_block = self.block_list[begin_index]
+        if payload['index'] == transit_block['index']:
+            if payload['begin'] == transit_block['begin']:
                 block_len = len(payload['block'])
-                if block_len == struct.unpack("!i", self.transit_block['length'])[0]:
+                if block_len == struct.unpack("!i", transit_block['length'])[0]:
                     self.block_list[begin_index] = payload['block']
                     return begin_index
         return -1
@@ -471,22 +482,25 @@ class PeerListener(object):
         #### Fix this so that you dont make multiple request of the same offset
         request_id = struct.pack("b", 6)
         message_len = struct.pack("!i", 13)
+        transit_block = {}
         for block_key in self.block_list:
             if self.block_list[block_key] == '':
                 ##### If I make the block list have the transit block dict as a
                 ##### key I can make multiple request and check the validaty
-                self.transit_block['begin'] = struct.pack("!i", self.block_request_size * block_key)
-                self.transit_block['index'] = struct.pack("!i", self.piece_index)
+                transit_block['begin'] = struct.pack("!i", self.block_request_size * block_key)
+                transit_block['index'] = struct.pack("!i", self.piece_index)
                 if block_key == len(self.block_list) - 1 and self.last_block > 0:
-                    self.transit_block['length'] = struct.pack("!i", self.last_block)
-                    message = message_len + request_id + self.transit_block['index'] + \
-                              self.transit_block['begin'] + self.transit_block['length']
-                    return message
+                    transit_block['length'] = struct.pack("!i", self.last_block)
+                    message = message_len + request_id + transit_block['index'] + \
+                              self.transit_block['begin'] + transit_block['length']
                 else:
-                    self.transit_block['length'] = struct.pack("!i", self.block_request_size)
-                    message = message_len + request_id + self.transit_block['index'] + \
-                              self.transit_block['begin'] + self.transit_block['length']                    
-                    return message
+                    transit_block['length'] = struct.pack("!i", self.block_request_size)
+                    message = message_len + request_id + transit_block['index'] + \
+                              transit_block['begin'] + transit_block['length']                    
+                self.block_list[block_key] = transit_block
+                return message
+
+
 
     def get_assembled_piece(self):
         complete_piece = ""
