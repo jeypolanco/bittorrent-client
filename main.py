@@ -181,7 +181,7 @@ class PieceAssembler(object):
             inpf.write(tmp_buff)
 
     def loop(self):
-        while True:
+#        while True:
             want_to_read = []
             want_to_write = []
             for peer in self.connected_peers:
@@ -205,13 +205,19 @@ class PieceAssembler(object):
             # add code that will delete the peer from the connected dict or list
             # if it's timestamp expires
             for r in rs:
-                output = r.sock.recv(4096)
+                output = r.sock.recv(2**14)
                 if len(output) == 0:
                     r.sock.close()
                     self.connected_peers.remove(r)
                     self.connected_peers.append(self.connect_to_new_peer(self.peer_list))
                 else:
-                    r.set_state(r.parse_messages(output))
+                    r.append_to_msg_stream(output)                    
+                    raw_message = r.get_full_raw_message(r.get_message_stream())
+                    while raw_message:
+                        r.set_state(r.parse_raw_message(raw_message))
+                        r.slice_message_from_stream(len(raw_message))
+                        raw_message = r.get_full_raw_message(r.get_message_stream())
+#                    r.set_state(r.parse_messages(output))
                     r.most_recent_read = int(time.time())
             for w in ws:
                 w.set_state(w.generate_msg())
@@ -231,7 +237,7 @@ class PeerListener(object):
         self.most_recent_read = None
         self.piece_index = None
         self.pieces_list = None
-        self.msg_recv = ""
+        self.message_stream = ""
         self.id_dict = {'bitfield': 5, 'have': 4, 'keep alive': 0, 'unchoke': 1, 'choke': 0, 'piece': 7}
         self.info_hash = hashlib.sha1(bencode.bencode(metainfo['info'])).digest()
         
@@ -246,6 +252,12 @@ class PeerListener(object):
             self.sock.close()
             self.connected = False
 
+    def append_to_msg_stream(self, stream):
+        self.message_stream += stream
+
+    def slice_message_from_stream(self, message_len):
+        self.message_stream = self.message_stream[message_len:]
+        
     def is_connected(self):
         return self.connected
 
@@ -256,42 +268,71 @@ class PeerListener(object):
         """Returns a dictionary consisting of variables that define the state of the peer"""
         return self.state
 
-    def parse_messages(self, raw_message):
-        message_list = []
-        last_complete_message = True
-        while last_complete_message and len(raw_message) > 4:
-            message_dict = {}
-            # This is only necessary because I want the method that I use to set
-            # the state of the peer to take messages that have both been sent
-            # and received.
-            message_dict['sent'] = ''
-            message_dict['prefix length'] = struct.unpack(">i", raw_message[0:4])[0]
-            raw_payload = raw_message[4:message_dict['prefix length'] + 4]
-            # keep-alive message
-            if message_dict['prefix length'] == 0:
-                message_dict['message id'] = message_dict['prefix length']
-                next_msg_offset = message_dict['prefix length'] + 4
-                raw_message = raw_message[next_msg_offset:]
-                message_list.append(message_dict)
-            # handshake response
-            elif raw_message[:20] == '\x13BitTorrent protocol':
-                message_dict['message id'] = 'handshake'
-                message_dict['payload'] =  raw_message[0:68]
-                raw_message = raw_message[68:]
-                message_list.append(message_dict)
-            # all other bt protocol messages
-            elif len(raw_payload) == message_dict['prefix length']:
-                message_dict['message id'] = struct.unpack(">b", raw_message[4])[0]
-                message_dict['payload'] = self.parse_payload(raw_payload)
-                message_list.append(message_dict)
-                next_msg_offset = message_dict['prefix length'] + 4
-                raw_message = raw_message[next_msg_offset:]                    
-            else:
-                # I need to save the incomplete message and add it to the raw
-                # message for the next time this method is called
-                message_dict['incomplete'] = raw_message
-                last_complete_message = False
-        return message_list
+    def get_message_stream(self):
+        return self.message_stream
+    
+    def get_full_raw_message(self, message_stream):
+        """Method will return a message """
+        message = ''
+        if message_stream[:20] == '\x13BitTorrent protocol':
+            message = message_stream[0:68]
+        else:
+            if len(message_stream) >= 5:
+                prefix_len = struct.unpack(">i", message_stream[0:4])[0]
+                raw_payload = message_stream[4:prefix_len + 4]
+                if len(raw_payload) == prefix_len:
+                    message = message_stream[0:prefix_len+4]
+        return message
+
+    def parse_raw_message(self, message):
+        message_dict = {'sent': '', 'incomplete': ''}
+        if message[:20] == '\x13BitTorrent protocol':        
+            message_dict['message id'] = 'handshake'
+            message_dict['payload'] =  message[0:68]
+
+        else:
+            message_dict['prefix length'] = struct.unpack(">i", message[0:4])[0]            
+            raw_payload = message[4:message_dict['prefix length'] + 4]
+            message_dict['message id'] = struct.unpack(">b", message[4])[0]
+            message_dict['payload'] = self.parse_payload(raw_payload)
+        return message_dict
+
+#    def parse_messages(self, raw_message):
+#        message_list = []
+#        last_complete_message = True
+#        while last_complete_message and len(raw_message) > 4:
+#            message_dict = {'sent': '', 'incomplete': ''}
+#            # This is only necessary because I want the method that I use to set
+#            # the state of the peer to take messages that have both been sent
+#            # and received.
+#            message_dict['prefix length'] = struct.unpack(">i", raw_message[0:4])[0]
+#            raw_payload = raw_message[4:message_dict['prefix length'] + 4]
+##            # keep-alive message
+##            if message_dict['prefix length'] == 0:
+##                message_dict['message id'] = message_dict['prefix length']
+##                next_msg_offset = message_dict['prefix length'] + 4
+##                raw_message = raw_message[next_msg_offset:]
+##                message_list.append(message_dict)
+#            # handshake response
+#            if raw_message[:20] == '\x13BitTorrent protocol':
+#                message_dict['message id'] = 'handshake'
+#                message_dict['payload'] =  raw_message[0:68]
+#                raw_message = raw_message[68:]
+#                message_list.append(message_dict)
+#            # all other bt protocol messages
+#            elif len(raw_payload) == message_dict['prefix length']:
+#                message_dict['message id'] = struct.unpack(">b", raw_message[4])[0]
+#                message_dict['payload'] = self.parse_payload(raw_payload)
+#                message_list.append(message_dict)
+#                next_msg_offset = message_dict['prefix length'] + 4
+#                raw_message = raw_message[next_msg_offset:]                    
+#            else:
+#                # I need to save the incomplete message and add it to the raw
+#                # message for the next time this method is called
+#                message_dict['incomplete'] = raw_message
+#                message_list.append(message_dict)
+#                last_complete_message = False
+#        return message_list
 
     def parse_payload(self, raw_payload):
         payload_dict = {}
@@ -306,36 +347,45 @@ class PeerListener(object):
             payload_dict['block'] = raw_payload[9:]
         return payload_dict
 
-    def set_state(self, message_list):
+    def set_state(self, message_dict):
         """Method takes a list of messages read or written by the peer and uses the
-        message id to set the state"""
-        for message in message_list:
-            print message
-            if message['sent'] == 'request':
-                self.state['sent request'] = True
-            elif message['sent'] == 'interested':
-                self.state['sent interested'] = True
-            elif message['sent'] == 'handshake':
-                self.state['sent handshake'] = True
-            elif message['message id'] == 'handshake':
-                self.state['received handshake'] = True
-            elif message['message id'] == self.id_dict['bitfield']:
-                self.pieces_list = message['payload']['bitfield']
-                self.state['received pieces list'] = True
-            elif message['message id'] == self.id_dict['have']:
-                index = struct.unpack('!i', message['payload']['piece index'])[0]
-                self.pieces_list[index] = True
-            elif message['prefix length'] == self.id_dict['keep alive']:
-                pass
-            elif message['message id'] == self.id_dict['unchoke']:
-                self.state['received unchoke'] = True
-            elif message['message id'] == self.id_dict['choke']:
-                self.state['received unchoke'] = False
-                self.state['sent interested'] = False
-            elif message['message id'] == self.id_dict['piece']:
-                self.set_block(message['payload'])
-        return 0
-                    
+        message id to set the state.  It returns a list of all states matched"""
+#        state_match_list = []
+#        for message in message_list:
+        if message_dict['sent'] == 'request':
+            self.state['sent request'] = True
+            return message_dict['sent']
+        elif message_dict['sent'] == 'interested':
+            self.state['sent interested'] = True
+            return message_dict['sent']
+        elif message_dict['sent'] == 'handshake':
+            self.state['sent handshake'] = True
+            return message_dict['sent']
+        elif message_dict['message id'] == 'handshake':
+            self.state['received handshake'] = True
+            return message_dict['message id']
+        elif message_dict['message id'] == self.id_dict['bitfield']:
+            self.pieces_list = message_dict['payload']['bitfield']
+            self.state['received pieces list'] = True
+            return message_dict['message id']
+        elif message_dict['message id'] == self.id_dict['have']:
+            index = struct.unpack('!i', message_dict['payload']['piece index'])[0]
+            self.pieces_list[index] = True
+            return message_dict['message id']
+        elif message_dict['prefix length'] == self.id_dict['keep alive']:
+            return message_dict['prefix length']
+        elif message_dict['message id'] == self.id_dict['unchoke']:
+            self.state['received unchoke'] = True
+            return message_dict['message id']
+        elif message_dict['message id'] == self.id_dict['choke']:
+            self.state['received unchoke'] = False
+            self.state['sent interested'] = False
+            return message_dict['message id']
+        elif message_dict['message id'] == self.id_dict['piece']:
+            self.set_block(message_dict['payload'])
+            return message_dict['message id']
+        else:
+            return 'no state change'
 
     def get_block_list(self):
         """Method returns an empty block list with the index values of each block as a
@@ -360,15 +410,18 @@ class PeerListener(object):
 
         
     def set_block(self, payload):
-        """Save block from peer to a dictionary"""
+        """Save block from peer to a dictionary and return the index value of the block"""
         #### Set up your logic for handling pieces here####
         #### Have a variable that stores the blocks in transit ####
         if payload['index'] == self.transit_block['index']:
-            begin = self.block_request_size * struct.unpack("!i", payload[4:8])
-            if begin == self.transit_block['begin']:
-                block_len = len(payload[9:])
-                if block_len == self.transit_block['length']:
-                    self.block_list[index] = payload[9:]
+            begin = struct.unpack("!i", payload['begin'])[0]
+            begin_index = begin / self.block_request_size
+            if payload['begin'] == self.transit_block['begin']:
+                block_len = len(payload['block'])
+                if block_len == struct.unpack("!i", self.transit_block['length'])[0]:
+                    self.block_list[begin_index] = payload['block']
+                    return begin_index
+        return -1
                 
     def write(self, message):
         try:
@@ -383,7 +436,7 @@ class PeerListener(object):
         a dict with the value of the sent message
 
         """
-        message = {'sent': '', 'message id': '', 'payload': '', 'prefix length': ''}
+        message = {'sent': '', 'message id': '', 'payload': '', 'prefix length': '', 'incomplete': ''}
         if self.state['received handshake']:
             if self.state['received pieces list']:
                 if self.state['received unchoke']:
@@ -409,16 +462,19 @@ class PeerListener(object):
                 sent_len = self.write(msg)
                 if len(msg) == sent_len:
                     message['sent'] = 'handshake'
-        return [message]
+        return message
 
     def get_interested_msg(self):
         return '\x00\x00\x00\x01\x02'
     
     def get_request_msg(self):
+        #### Fix this so that you dont make multiple request of the same offset
         request_id = struct.pack("b", 6)
         message_len = struct.pack("!i", 13)
         for block_key in self.block_list:
             if self.block_list[block_key] == '':
+                ##### If I make the block list have the transit block dict as a
+                ##### key I can make multiple request and check the validaty
                 self.transit_block['begin'] = struct.pack("!i", self.block_request_size * block_key)
                 self.transit_block['index'] = struct.pack("!i", self.piece_index)
                 if block_key == len(self.block_list) - 1 and self.last_block > 0:
