@@ -1,3 +1,4 @@
+import logging
 import time
 import bitstring
 import select
@@ -20,7 +21,8 @@ class PieceAssembler(object):
         # 20-byte hashes, one for each piece in the torrent
         self.num_pieces = len(metainfo['info']['pieces'])/20
         self.missing_pieces = range(self.num_pieces)
-        self.connected_peers = self.connect_to_peers(self.peer_list)
+        if not self.peer_list == -1:
+            self.connected_peers = self.connect_to_peers(self.peer_list)
         # This is a list of pieces that have been assigned to be fetched by a peer
         self.transit = [] 
         # This is a dict with keys corresponding to the index value of a piece
@@ -31,7 +33,7 @@ class PieceAssembler(object):
         tracker_list = []
         if 'http' in metainfo['announce']:
             tracker_list.append(metainfo['announce'])
-        for tracker in metainfo['announce-list']:
+        for tracker in metainfo.get('announce-list', []):
             if 'http' in tracker[0]:
                 tracker_list.append(tracker[0])
         return tracker_list
@@ -48,8 +50,11 @@ class PieceAssembler(object):
                     print response['failure reason']
                 elif response.has_key('peers'):
                     peer_str_response += response['peers']
-        peer_list = self.get_peer_addr_list(peer_str_response)
-        return peer_list
+        if len(peer_str_response) == 0:
+            return -1
+        else:
+            peer_list = self.get_peer_addr_list(peer_str_response)
+            return peer_list
         
     def get_peer_addr_list(self, response):
         peer_list = []
@@ -63,15 +68,17 @@ class PieceAssembler(object):
 
     def connect_to_peers(self, peer_list):
         connected_peers = []
+        connected_addr = set()
         for peer_addr in peer_list:
             # Change this back to 25 when you finish debugging
             ## I'm going to assume that a peer will only ever have one port
             ## listening for connections
-            if len(connected_peers) < 4:
+            if len(connected_peers) < 2 and peer_addr['ip'] not in connected_addr:
                 peer = PeerListener(peer_addr, self.metainfo)
                 if peer.is_connected():
                     print peer.is_connected()
                     connected_peers.append(peer)
+                    connected_addr.add(peer_addr['ip'])
                 else:
                     continue
         return connected_peers
@@ -91,9 +98,12 @@ class PieceAssembler(object):
         }
         try:
             tracker_connection = requests.get(url, params=params, timeout=2.0)
-            response = tracker_connection.content
-            if response:
-                return bencode.bdecode(response)
+            tracker_response = tracker_connection.content
+            if tracker_response == None:
+                raise Exception("The tracker is returning nothing!")
+            assert len(tracker_response) != 0
+            bresponse = bencode.bdecode(tracker_response)
+            return bresponse
         except requests.exceptions.Timeout as err:
             print err
 
@@ -111,15 +121,20 @@ class PieceAssembler(object):
         
     def connect_to_new_peer(self, peer_list):
         for peer_addr in peer_list:
-            for peer in self.connected_peers:
-                try:
-                    sock_addr = peer.sock.getpeername()[0]
-                    if peer_addr != sock_addr:
-                        peer = PeerListener(peer_addr, self.metainfo)
-                        if peer.is_connected():
-                            return peer
-                except socket.error as err:
-                    print err
+            if len(self.connected_peers) == 0:
+                peer = PeerListener(peer_addr, self.metainfo)
+                if peer.is_connected():
+                    return peer
+            else:
+                for peer in self.connected_peers:
+                    try:
+                        sock_addr = peer.sock.getpeername()[0]
+                        if peer_naddr != sock_addr:
+                            peer = PeerListener(peer_addr, self.metainfo)
+                            if peer.is_connected():
+                                return peer
+                    except socket.error as err:
+                        print err
             
 #    def has_missing(self):
 #        """Returns true if there are pieces missing for assembling the torrent file."""
@@ -137,19 +152,10 @@ class PieceAssembler(object):
             else:
                 return piece
 
-
-    def set_piece(self, piece, data, peer):
-        complete_piece_hash = hashlib.sha1(piece).digest()
-        piece_hash = peer.get_piece_hash(self.piece_index)
-        if complete_piece_hash == piece_hash:
-            self.pieces[piece] = data
-        self.reset_peer(piece, peer)
-
     def reset_peer(self, piece, peer):
         """Set peer to a state where it can request a piece"""
         self.transit.remove(piece)
         self.missing_pieces.remove(piece)
-        peer.getting_piece = False
         
     def finish(self):
         """Assembles the torrent file and exits the program"""
@@ -186,19 +192,69 @@ class PieceAssembler(object):
         with open(file_name, 'wb') as inpf:
             inpf.write(tmp_buff)
 
+    def replace(self, peer):
+        peer.sock.close()
+        print self.connected_peers
+        print self.peer_list
+        self.connected_peers.remove(peer)
+        new_peer = self.connect_to_new_peer(self.peer_list)
+        self.connected_peers.append(new_peer)
+        print self.connected_peers
+        return new_peer
+
+
+    def check_hash_piece(self, piece_index, piece):
+        peer_piece_hash = hashlib.sha1(piece).digest()
+        begin_slice = piece_index * 20
+        end_slice = begin_slice + 20
+        metainfo_piece_hash = self.metainfo['info']['pieces'][begin_slice:end_slice]
+        if peer_piece_hash == metainfo_piece_hash:
+            return True
+        else:
+            return False
+
+    def peer_in_read_state(self, peer):
+        """Peer will always be in a read state unless it's finished assembling all it's
+        blocks"""
+        if peer.state['missing block']:
+            return True
+
+    def peer_in_write_state(self, peer):
+        if peer.state['sent interested']:
+            if peer.state['getting piece']:
+                if peer.state['missing blocks']:
+                    return True
+
+    def peer_is_finished(self, peer):
+        if not peer.state['missing block']:
+            return True
+
     def loop(self):
-#        while True:
+        while True:
+            time.sleep(5)
             want_to_read = []
             want_to_write = []
             for peer in self.connected_peers:
+                # If I append a peer to read but it turns out that the peer is
+                # actually finished how do I stop select from blocking?  Call it
+                # only if there are peers that want to read or write.
                 want_to_read.append(peer)
                 if peer.state['sent interested']:
                     if peer.state['getting piece']:
                         if peer.state['missing blocks']:
-                            want_to_write.append(peer)
+                            if len(self.pieces) == self.num_pieces:
+                                self.finish()
+                            else:
+                                want_to_write.append(peer)
                         else:
-                            self.set_piece(peer.piece_index,
-                                           peer.get_assembled_piece(), peer)
+                            piece = peer.get_assembled_piece()
+                            if self.check_hash_piece(peer.piece_index, piece):
+                                self.pieces[peer.piece_index] = piece
+                                self.transit.remove(peer.piece_index)
+                                self.missing_pieces.remove(peer.piece_index)
+                                want_to_read.remove(peer)
+                                want_to_write.append(self.replace(peer))
+                                
                     else:
                         if peer.state['received pieces list']:
                             missing_piece = self.get_missing_piece()
@@ -207,15 +263,14 @@ class PieceAssembler(object):
                                 self.transit.append(missing_piece)                                
                 else:
                     want_to_write.append(peer)
+
             rs, ws, xs = select.select(want_to_read, want_to_write, [])
             # add code that will delete the peer from the connected dict or list
             # if it's timestamp expires
             for r in rs:
                 output = r.sock.recv(2**14)
                 if len(output) == 0:
-                    r.sock.close()
-                    self.connected_peers.remove(r)
-                    self.connected_peers.append(self.connect_to_new_peer(self.peer_list))
+                    self.replace(peer)
                 else:
                     r.append_to_msg_stream(output)                    
                     raw_message = r.get_full_raw_message(r.get_message_stream())
@@ -223,10 +278,9 @@ class PieceAssembler(object):
                         r.set_state(r.parse_raw_message(raw_message))
                         r.slice_message_from_stream(len(raw_message))
                         raw_message = r.get_full_raw_message(r.get_message_stream())
-#                    r.set_state(r.parse_messages(output))
                     r.most_recent_read = int(time.time())
             for w in ws:
-                w.set_state(w.generate_msg())
+                w.set_state(w.send_msg())
 
 class PeerListener(object):
     def __init__(self, peer_addr, metainfo):
@@ -242,7 +296,8 @@ class PeerListener(object):
         
         self.most_recent_read = None
         self.piece_index = None
-        self.pieces_list = None
+        num_pieces = len(self.metainfo['info']['pieces'])/20
+        self.pieces_list = bitstring.BitArray(length=self.get_valid_bitarray_len(num_pieces))
         self.message_stream = ""
         self.id_dict = {'bitfield': 5, 'have': 4, 'keep alive': 0, 'unchoke': 1, 'choke': 0, 'piece': 7}
         self.info_hash = hashlib.sha1(bencode.bencode(metainfo['info'])).digest()
@@ -258,6 +313,14 @@ class PeerListener(object):
             self.sock.close()
             self.connected = False
 
+    def get_valid_bitarray_len(self, num_pieces):
+        bitfield_byte_num = num_pieces / 8
+        remainder = num_pieces % 8
+        if remainder != 0:
+            return 8 * (bitfield_byte_num + 1)
+        else:
+            return 8 * bitfield_byte_num
+        
     def append_to_msg_stream(self, stream):
         self.message_stream += stream
 
@@ -295,50 +358,15 @@ class PeerListener(object):
         if message[:20] == '\x13BitTorrent protocol':        
             message_dict['message id'] = 'handshake'
             message_dict['payload'] =  message[0:68]
-
         else:
-            message_dict['prefix length'] = struct.unpack(">i", message[0:4])[0]            
-            raw_payload = message[4:message_dict['prefix length'] + 4]
-            message_dict['message id'] = struct.unpack(">b", message[4])[0]
-            message_dict['payload'] = self.parse_payload(raw_payload)
+            message_dict['prefix length'] = struct.unpack(">i", message[0:4])[0]
+            if message_dict['prefix length'] == 0:
+                message_dict['message id'] = 'keep alive'
+            else:
+                raw_payload = message[4:message_dict['prefix length'] + 4]
+                message_dict['message id'] = struct.unpack(">b", message[4])[0]
+                message_dict['payload'] = self.parse_payload(raw_payload)
         return message_dict
-
-#    def parse_messages(self, raw_message):
-#        message_list = []
-#        last_complete_message = True
-#        while last_complete_message and len(raw_message) > 4:
-#            message_dict = {'sent': '', 'incomplete': ''}
-#            # This is only necessary because I want the method that I use to set
-#            # the state of the peer to take messages that have both been sent
-#            # and received.
-#            message_dict['prefix length'] = struct.unpack(">i", raw_message[0:4])[0]
-#            raw_payload = raw_message[4:message_dict['prefix length'] + 4]
-##            # keep-alive message
-##            if message_dict['prefix length'] == 0:
-##                message_dict['message id'] = message_dict['prefix length']
-##                next_msg_offset = message_dict['prefix length'] + 4
-##                raw_message = raw_message[next_msg_offset:]
-##                message_list.append(message_dict)
-#            # handshake response
-#            if raw_message[:20] == '\x13BitTorrent protocol':
-#                message_dict['message id'] = 'handshake'
-#                message_dict['payload'] =  raw_message[0:68]
-#                raw_message = raw_message[68:]
-#                message_list.append(message_dict)
-#            # all other bt protocol messages
-#            elif len(raw_payload) == message_dict['prefix length']:
-#                message_dict['message id'] = struct.unpack(">b", raw_message[4])[0]
-#                message_dict['payload'] = self.parse_payload(raw_payload)
-#                message_list.append(message_dict)
-#                next_msg_offset = message_dict['prefix length'] + 4
-#                raw_message = raw_message[next_msg_offset:]                    
-#            else:
-#                # I need to save the incomplete message and add it to the raw
-#                # message for the next time this method is called
-#                message_dict['incomplete'] = raw_message
-#                message_list.append(message_dict)
-#                last_complete_message = False
-#        return message_list
 
     def parse_payload(self, raw_payload):
         payload_dict = {}
@@ -371,16 +399,11 @@ class PeerListener(object):
             self.state['received handshake'] = True
             return message_dict['message id']
         elif message_dict['message id'] == self.id_dict['bitfield']:
-            self.pieces_list = message_dict['payload']['bitfield']
-            self.state['received pieces list'] = True
+            self.state['received pieces list'] = self.set_pieces_list(message_dict['payload']['bitfield'])
             return message_dict['message id']
         elif message_dict['message id'] == self.id_dict['have']:
             index = struct.unpack('!i', message_dict['payload']['piece index'])[0]
-            if self.pieces_list != None:
-                self.pieces_list[index] = True
-            else:
-                self.pieces_list = bitstring.BitArray(len(self.metainfo['info']['pieces'])/20)
-                self.pieces_list[index] = True
+            self.state['received pieces list'] = self.set_pieces_list(index)
             return message_dict['message id']
         elif message_dict['prefix length'] == self.id_dict['keep alive']:
             return message_dict['prefix length']
@@ -394,8 +417,19 @@ class PeerListener(object):
         elif message_dict['message id'] == self.id_dict['piece']:
             self.set_block(message_dict['payload'])
             return message_dict['message id']
+        elif message_dict['message id'] == 'have all blocks':
+            self.state['missing blocks'] = False
         else:
             return 'no state change'
+
+    def set_pieces_list(self, value):
+        """Assign the pieces that a peer has to the pieces_list data structure"""
+        if type(value) == int:
+            self.pieces_list[value] = True
+        else:
+            for piece in range(len(value)):
+                self.pieces_list[piece] = value[piece]
+        return True
 
     def get_block_list(self):
         """Method returns an empty block list with the index values of each block as a
@@ -416,7 +450,7 @@ class PeerListener(object):
                     block_dict[index+1] = ''
             else:
                 block_dict[index] = ''
-        return block_dict, remainder
+        return (block_dict, remainder)
 
         
     def set_block(self, payload):
@@ -431,6 +465,8 @@ class PeerListener(object):
                 block_len = len(payload['block'])
                 if block_len == struct.unpack("!i", transit_block['length'])[0]:
                     self.block_list[begin_index] = payload['block']
+                    index = struct.unpack("!i", payload['index'])[0]
+                    assert type(index) == int
                     return begin_index
         return -1
                 
@@ -442,7 +478,14 @@ class PeerListener(object):
             print err
             return 0
 
-    def generate_msg(self):
+    def have_all_blocks(self):
+        for key in self.block_list:
+            if type(self.block_list[key]) == dict or self.block_list[key] == '':
+                return False
+            else:
+                return True
+
+    def send_msg(self):
         """Method sends a single message according to the state of the peer and returns
         a dict with the value of the sent message
 
@@ -451,17 +494,21 @@ class PeerListener(object):
         if self.state['received handshake']:
             if self.state['received pieces list']:
                 if self.state['received unchoke']:
-                    ###### rewrite this so that it can send multiple request but
-                    ###### limit the number of request
-                    msg = self.get_request_msg()
-                    sent_len = self.write(msg)
-                    if len(msg) == sent_len:
-                        message['sent'] = 'request'
+                    # if the len of message is zero then either we have a
+                    # pending request or we have all block.  How can we tell
+                    # which is it?  If we have no dict values in the block_list.
+                    if self.have_all_blocks():
+                        message['message id'] = 'have all blocks'
+                    else:
+                        request_msg = self.get_request_msg()
+                        sent_len = self.write(request_msg)
+                        if len(request_msg) == sent_len:
+                            message['sent'] = 'request'
                 else:
                     if not self.state['sent interested']:
-                        msg = self.get_interested_msg()
-                        sent_len = self.write(msg)
-                        if len(msg) == sent_len:
+                        interested_msg = self.get_interested_msg()
+                        sent_len = self.write(interested_msg)
+                        if len(interested_msg) == sent_len:
                             message['sent'] = 'interested'                    
             else:
                 # peer is connected and received a hanshake but is waiting
@@ -469,9 +516,9 @@ class PeerListener(object):
                 message['sent'] = ''
         else:
             if not self.state['sent handshake']:
-                msg = self.get_handshake_msg()
-                sent_len = self.write(msg)
-                if len(msg) == sent_len:
+                handshake_msg = self.get_handshake_msg()
+                sent_len = self.write(handshake_msg)
+                if len(handshake_msg) == sent_len:
                     message['sent'] = 'handshake'
         return message
 
@@ -479,28 +526,34 @@ class PeerListener(object):
         return '\x00\x00\x00\x01\x02'
     
     def get_request_msg(self):
-        #### Fix this so that you dont make multiple request of the same offset
+        # What will this program do if I try to get a request msg with one
+        # already in transit?  It will return an empty string.  I need to take
+        # into account the possibility that I may have requested a piece but
+        # have not receieved it yet.
+        ## Do nothing.
         request_id = struct.pack("b", 6)
         message_len = struct.pack("!i", 13)
         transit_block = {}
+        message = ''
         for block_key in self.block_list:
-            if self.block_list[block_key] == '':
-                ##### If I make the block list have the transit block dict as a
-                ##### key I can make multiple request and check the validaty
+            # If the requested block has not been returned in under 20 seconds
+            # or the block hasn't been requested issue the request
+            print self.block_list
+            if self.block_list[block_key] == '' or (self.block_list[block_key]['time'] - time.time()) > 20:
                 transit_block['begin'] = struct.pack("!i", self.block_request_size * block_key)
                 transit_block['index'] = struct.pack("!i", self.piece_index)
-                if block_key == len(self.block_list) - 1 and self.last_block > 0:
-                    transit_block['length'] = struct.pack("!i", self.last_block)
+                transit_block['time'] = time.time()
+                # This handles the case where the last block is smaller than the other requested block
+                if block_key == len(self.block_list) - 1 and self.last_block_size > 0:
+                    transit_block['length'] = struct.pack("!i", self.last_block_size)
                     message = message_len + request_id + transit_block['index'] + \
-                              self.transit_block['begin'] + transit_block['length']
+                              transit_block['begin'] + transit_block['length']
                 else:
                     transit_block['length'] = struct.pack("!i", self.block_request_size)
                     message = message_len + request_id + transit_block['index'] + \
-                              transit_block['begin'] + transit_block['length']                    
+                              transit_block['begin'] + transit_block['length']
                 self.block_list[block_key] = transit_block
-                return message
-
-
+        return message
 
     def get_assembled_piece(self):
         complete_piece = ""
@@ -538,10 +591,15 @@ def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("t_file", help="this is the torrent file we aim to download")
     args = arg_parser.parse_args()
+    logging.basicConfig(filename='bt.log', level=logging.DEBUG)    
     with open(args.t_file, 'rb') as inpf:
         metainfo = bencode.bdecode(inpf.read())
     piece_assembler = PieceAssembler(metainfo)
-    piece_assembler.loop()
+    if piece_assembler.peer_list == -1:
+        print "torrent has no peers"
+        return -1
+    else:
+        piece_assembler.loop()
     
 if __name__ == "__main__":
     main()
