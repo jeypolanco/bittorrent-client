@@ -253,7 +253,12 @@ class PieceAssembler(object):
                                 self.transit.remove(peer.piece_index)
                                 self.missing_pieces.remove(peer.piece_index)
                                 want_to_read.remove(peer)
-                                want_to_write.append(self.replace(peer))
+                                missing_piece = self.get_missing_piece()
+                                if peer.has_piece(missing_piece):
+                                    peer.state['missing blocks'] = True
+                                    peer.get_piece(missing_piece)
+                                    self.transit.append(missing_piece)                                
+                                want_to_write.append(peer)
                                 
                     else:
                         if peer.state['received pieces list']:
