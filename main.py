@@ -23,8 +23,6 @@ class PieceAssembler(object):
         self.missing_pieces = range(self.num_pieces)
         if not self.peer_list == -1:
             self.connected_peers = self.connect_to_peers(self.peer_list)
-        # This is a list of pieces that have been assigned to be fetched by a peer
-        self.transit = [] 
         # This is a dict with keys corresponding to the index value of a piece
         # and values corresponding to the data sent by a peer
         self.pieces = {}
@@ -147,14 +145,10 @@ class PieceAssembler(object):
     def get_missing_piece(self):
         """Return a missing piece not already assigned to a peer"""
         for piece in self.missing_pieces:
-            if piece in self.transit:
-                continue
-            else:
-                return piece
+            return piece
 
     def reset_peer(self, piece, peer):
         """Set peer to a state where it can request a piece"""
-        self.transit.remove(piece)
         self.missing_pieces.remove(piece)
         
     def finish(self):
@@ -202,17 +196,6 @@ class PieceAssembler(object):
         print self.connected_peers
         return new_peer
 
-
-    def check_hash_piece(self, piece_index, piece):
-        peer_piece_hash = hashlib.sha1(piece).digest()
-        begin_slice = piece_index * 20
-        end_slice = begin_slice + 20
-        metainfo_piece_hash = self.metainfo['info']['pieces'][begin_slice:end_slice]
-        if peer_piece_hash == metainfo_piece_hash:
-            return True
-        else:
-            return False
-
     def peer_in_read_state(self, peer):
         """Peer will always be in a read state unless it's finished assembling all it's
         blocks"""
@@ -235,9 +218,7 @@ class PieceAssembler(object):
             want_to_read = []
             want_to_write = []
             for peer in self.connected_peers:
-                # If I append a peer to read but it turns out that the peer is
-                # actually finished how do I stop select from blocking?  Call it
-                # only if there are peers that want to read or write.
+                # After a peer has a complete piece
                 want_to_read.append(peer)
                 if peer.state['sent interested']:
                     if peer.state['getting piece']:
@@ -248,24 +229,15 @@ class PieceAssembler(object):
                                 want_to_write.append(peer)
                         else:
                             piece = peer.get_assembled_piece()
-                            if self.check_hash_piece(peer.piece_index, piece):
-                                self.pieces[peer.piece_index] = piece
-                                self.transit.remove(peer.piece_index)
-                                self.missing_pieces.remove(peer.piece_index)
-                                want_to_read.remove(peer)
-                                missing_piece = self.get_missing_piece()
-                                if peer.has_piece(missing_piece):
-                                    peer.state['missing blocks'] = True
-                                    peer.get_piece(missing_piece)
-                                    self.transit.append(missing_piece)                                
-                                want_to_write.append(peer)
-                                
+                            self.pieces[peer.piece_index] = piece
+                            self.missing_pieces.remove(peer.piece_index)
+                            want_to_read.remove(peer)
+                            want_to_write.append(peer)
                     else:
                         if peer.state['received pieces list']:
                             missing_piece = self.get_missing_piece()
                             if peer.has_piece(missing_piece):
                                 peer.get_piece(missing_piece)
-                                self.transit.append(missing_piece)                                
                 else:
                     want_to_write.append(peer)
 
@@ -490,6 +462,19 @@ class PeerListener(object):
             else:
                 return True
 
+    def check_hash_piece(self):
+        piece = reduce(lambda a,z: a+self.block_list[z], self.block_list.keys(), '')
+        peer_piece_hash = hashlib.sha1(piece).digest()
+        begin_slice = self.piece_index * 20
+        end_slice = begin_slice + 20
+        metainfo_piece_hash = self.metainfo['info']['pieces'][begin_slice:end_slice]
+        print peer_piece_hash
+        print metainfo_piece_hash
+        if peer_piece_hash == metainfo_piece_hash:
+            return True
+        else:
+            return False
+            
     def send_msg(self):
         """Method sends a single message according to the state of the peer and returns
         a dict with the value of the sent message
@@ -502,7 +487,7 @@ class PeerListener(object):
                     # if the len of message is zero then either we have a
                     # pending request or we have all block.  How can we tell
                     # which is it?  If we have no dict values in the block_list.
-                    if self.have_all_blocks():
+                    if self.have_all_blocks() and self.check_hash_piece():
                         message['message id'] = 'have all blocks'
                     else:
                         request_msg = self.get_request_msg()
@@ -564,8 +549,18 @@ class PeerListener(object):
         complete_piece = ""
         for block in self.block_list:
             complete_piece += self.block_list[block]
+        self.reset_peer()
         return complete_piece
-                
+
+
+    def reset_peer(self):
+        self.state = {'sent handshake': True, 'sent interested': True, 'sent request': False,
+                      'getting piece': False, 'getting block': False, 'missing blocks': True,
+                      'received handshake': False, 'received pieces list': True, 'received unchoke': True}
+        self.block_list, self.last_block_size = self.get_block_list()
+        self.transit_block = {}
+        self.most_recent_read = None
+        
     def get_handshake_msg(self):
         pstrlen_pack = struct.pack('b', 19)
         pstr_pack = struct.pack('19s', 'BitTorrent protocol')
@@ -575,13 +570,6 @@ class PeerListener(object):
         handshake = pstrlen_pack + pstr_pack + reserved_pack + info_hash_pack + peer_id_pack
         return handshake
                         
-    def discard_piece(self):
-        self.piece_assembler.reset_peer(self, self.piece_index)
-        
-    def get_piece_hash(self, piece_index):
-        offset = piece_index * 20
-        return self.metainfo['info']['pieces'][offset:offset+20]
-
     def has_piece(self, piece_ind):
         if self.pieces_list[piece_ind]:
             return True

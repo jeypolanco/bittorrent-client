@@ -9,6 +9,9 @@ run: main.py
 rrun: main.py
 	python main.py $(tor_file)
 
+srun: main.py
+	python main.py sml.torrent
+
 testtorrentparse: main.py
 	python -m unittest testtorrentparser
 
